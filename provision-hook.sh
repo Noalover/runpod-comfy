@@ -17,8 +17,8 @@ curl -fL \
 chmod +x /tmp/provision.sh
 
 export COMFY_WORKSPACE="/workspace/runpod-slim/ComfyUI"
-export PYTHON_BIN="/workspace/runpod-slim/ComfyUI/.venv-cu128/bin/python"
-export PIP_BIN="/workspace/runpod-slim/ComfyUI/.venv-cu128/bin/pip"
+export PYTHON_BIN="${COMFY_WORKSPACE}/.venv-cu130/bin/python"
+export PIP_BIN="${COMFY_WORKSPACE}/.venv-cu130/bin/pip"
 
 /tmp/provision.sh
 
