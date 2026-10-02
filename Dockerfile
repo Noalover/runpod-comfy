@@ -1,9 +1,9 @@
-FROM runpod/comfyui:cuda13.0
+FROM runpod/comfyui:cuda12.8
 
 COPY provision-hook.sh /provision-hook.sh
-
 RUN chmod +x /provision-hook.sh
 
+# 공식 start.sh 안에 네 provisioning 실행을 삽입
 RUN sed -i \
     '/^# Start ComfyUI/i /provision-hook.sh' \
     /start.sh
