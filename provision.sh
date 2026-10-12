@@ -251,6 +251,19 @@ GIT_TIMEOUT="${GIT_TIMEOUT:-180}"
 GIT_RETRIES="${GIT_RETRIES:-3}"
 PIP_REQ_TIMEOUT="${PIP_REQ_TIMEOUT:-900}"
 
+# Civitai large-file downloader tuning.
+# aria2 uses multiple ranged connections so one bad CDN connection does not
+# drag a 20GB+ model down to a few hundred KB/s.
+CIVITAI_ARIA2_CONNECTIONS="${CIVITAI_ARIA2_CONNECTIONS:-8}"
+CIVITAI_ARIA2_SPLIT="${CIVITAI_ARIA2_SPLIT:-8}"
+CIVITAI_ARIA2_MIN_SPLIT_SIZE="${CIVITAI_ARIA2_MIN_SPLIT_SIZE:-4M}"
+CIVITAI_CONNECT_TIMEOUT="${CIVITAI_CONNECT_TIMEOUT:-15}"
+CIVITAI_IO_TIMEOUT="${CIVITAI_IO_TIMEOUT:-30}"
+CIVITAI_MAX_TRIES="${CIVITAI_MAX_TRIES:-20}"
+CIVITAI_RETRY_WAIT="${CIVITAI_RETRY_WAIT:-3}"
+CIVITAI_LOWEST_SPEED_LIMIT="${CIVITAI_LOWEST_SPEED_LIMIT:-64K}"
+CIVITAI_PROBE_TIMEOUT="${CIVITAI_PROBE_TIMEOUT:-30}"
+
 # Host preflight.
 HOST_PREFLIGHT="${HOST_PREFLIGHT:-1}"
 PREFLIGHT_ATTEMPTS="${PREFLIGHT_ATTEMPTS:-2}"
@@ -1458,6 +1471,550 @@ validate_downloaded_file_in_dir() {
 # DOWNLOADER
 # ============================================================
 
+provisioning_file_looks_complete() {
+
+  local path="$1"
+  local expected_size="${2:-0}"
+
+  [[ -f "$path" ]] || return 1
+
+  local actual_size
+  actual_size="$(
+    stat -c%s "$path" 2>/dev/null \
+    || echo 0
+  )"
+
+  if \
+    [[ "$expected_size" =~ ^[0-9]+$ ]] \
+    && [[ "$expected_size" -gt 0 ]]
+  then
+    [[ "$actual_size" -eq "$expected_size" ]]
+    return $?
+  fi
+
+  case "$path" in
+    *.safetensors|*.safetensors.part)
+
+      "$PYTHON_BIN" - "$path" >/dev/null 2>&1 <<'PY'
+import json
+import os
+import struct
+import sys
+
+path = sys.argv[1]
+
+try:
+    file_size = os.path.getsize(path)
+
+    if file_size < 16:
+        raise ValueError("file too small")
+
+    with open(path, "rb") as f:
+        raw = f.read(8)
+
+        if len(raw) != 8:
+            raise ValueError("missing safetensors header length")
+
+        header_size = struct.unpack("<Q", raw)[0]
+
+        if header_size <= 0 or header_size > file_size - 8:
+            raise ValueError("invalid safetensors header size")
+
+        header = json.loads(
+            f.read(header_size)
+        )
+
+    max_end = 0
+
+    for key, value in header.items():
+
+        if key == "__metadata__":
+            continue
+
+        offsets = value.get("data_offsets")
+
+        if (
+            not isinstance(offsets, list)
+            or len(offsets) != 2
+            or not all(isinstance(x, int) for x in offsets)
+        ):
+            raise ValueError("invalid data_offsets")
+
+        start, end = offsets
+
+        if start < 0 or end < start:
+            raise ValueError("invalid tensor offsets")
+
+        max_end = max(max_end, end)
+
+    if 8 + header_size + max_end != file_size:
+        raise ValueError("safetensors payload is incomplete")
+
+except Exception:
+    raise SystemExit(1)
+
+raise SystemExit(0)
+PY
+
+      return $?
+      ;;
+
+    *)
+      return 1
+      ;;
+  esac
+}
+
+
+provisioning_civitai_probe() {
+
+  local source_url="$1"
+
+  local header_file
+  header_file="$(mktemp)"
+
+  local effective_url=""
+  local rc=0
+
+  set +e
+
+  effective_url="$(
+    curl \
+      -fsSIL \
+      --connect-timeout "$CIVITAI_CONNECT_TIMEOUT" \
+      --max-time "$CIVITAI_PROBE_TIMEOUT" \
+      --retry 2 \
+      --retry-delay 2 \
+      --retry-all-errors \
+      -A "Mozilla/5.0" \
+      -D "$header_file" \
+      -o /dev/null \
+      -w '%{url_effective}' \
+      "$source_url" \
+      2>/dev/null
+  )"
+
+  rc=$?
+
+  set -e
+
+  if \
+    [[ $rc -ne 0 ]] \
+    || [[ -z "$effective_url" ]]
+  then
+
+    rm -f "$header_file"
+
+    return 1
+  fi
+
+  set +e
+
+  "$PYTHON_BIN" - \
+    "$header_file" \
+    "$effective_url" <<'PY'
+import os
+import re
+import sys
+from urllib.parse import unquote, urlsplit
+
+header_path, effective_url = sys.argv[1:3]
+
+blocks = []
+current = {}
+
+try:
+    with open(
+        header_path,
+        "r",
+        encoding="iso-8859-1",
+        errors="replace",
+    ) as f:
+
+        for raw in f:
+
+            line = raw.rstrip("\r\n")
+
+            if line.startswith("HTTP/"):
+                if current:
+                    blocks.append(current)
+
+                current = {}
+                continue
+
+            if not line or ":" not in line:
+                continue
+
+            key, value = line.split(":", 1)
+
+            current[
+                key.strip().lower()
+            ] = value.strip()
+
+    if current:
+        blocks.append(current)
+
+except Exception:
+    blocks = []
+
+headers = blocks[-1] if blocks else {}
+
+filename = ""
+
+content_disposition = headers.get(
+    "content-disposition",
+    "",
+)
+
+if content_disposition:
+
+    m = re.search(
+        r"filename\*\s*=\s*(?:UTF-8''|utf-8'')?([^;]+)",
+        content_disposition,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+        filename = unquote(
+            m.group(1).strip().strip('"')
+        )
+
+    if not filename:
+
+        m = re.search(
+            r'filename\s*=\s*"([^"]+)"',
+            content_disposition,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            filename = m.group(1)
+
+    if not filename:
+
+        m = re.search(
+            r"filename\s*=\s*([^;]+)",
+            content_disposition,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            filename = m.group(1).strip().strip('"')
+
+if not filename:
+
+    filename = unquote(
+        os.path.basename(
+            urlsplit(effective_url).path
+        )
+    )
+
+filename = os.path.basename(
+    filename.replace("\x00", "")
+).strip()
+
+content_length = headers.get(
+    "content-length",
+    "0",
+).strip()
+
+try:
+    expected_size = int(content_length)
+except Exception:
+    expected_size = 0
+
+if expected_size < 0:
+    expected_size = 0
+
+print(filename)
+print(expected_size)
+PY
+
+  rc=$?
+
+  set -e
+
+  rm -f "$header_file"
+
+  return "$rc"
+}
+
+
+provisioning_civitai_aria2_download() {
+
+  local dir="$1"
+  local source_url="$2"
+
+  mkdir -p "$dir"
+
+  local probe=()
+  local probe_file
+  probe_file="$(mktemp)"
+
+  set +e
+
+  provisioning_civitai_probe \
+    "$source_url" \
+    > "$probe_file"
+
+  local probe_rc=$?
+
+  set -e
+
+  if [[ $probe_rc -eq 0 ]]; then
+    mapfile -t probe < "$probe_file"
+  fi
+
+  rm -f "$probe_file"
+
+  local filename=""
+  local expected_size=0
+
+  if [[ $probe_rc -eq 0 ]]; then
+
+    filename="${probe[0]:-}"
+    expected_size="${probe[1]:-0}"
+
+  fi
+
+  # If HEAD probing did not reveal a plausible model filename,
+  # fall back to aria2 Content-Disposition mode rather than saving
+  # a CDN object name without the proper extension.
+  case "$filename" in
+    *.safetensors|*.ckpt|*.pt|*.pth|*.bin|*.gguf|*.zip)
+      ;;
+    *)
+      filename=""
+      ;;
+  esac
+
+  if [[ ! "$expected_size" =~ ^[0-9]+$ ]]; then
+    expected_size=0
+  fi
+
+  if \
+    [[ -n "$filename" ]] \
+    && [[ "$filename" != "." ]] \
+    && [[ "$filename" != "/" ]]
+  then
+
+    local final_path="${dir}/${filename}"
+    local part_path="${final_path}.part"
+    local part_name="${filename}.part"
+
+    log "Civitai resolved filename: $filename"
+
+    if [[ "$expected_size" -gt 0 ]]; then
+      log "Civitai expected size: $expected_size bytes"
+    else
+      log "Civitai expected size unavailable; safetensors structure will be used for final validation when possible."
+    fi
+
+    if provisioning_file_looks_complete \
+      "$final_path" \
+      "$expected_size"
+    then
+
+      local complete_size
+      complete_size="$(
+        stat -c%s "$final_path" 2>/dev/null \
+        || echo 0
+      )"
+
+      log "Civitai file already complete, skipping: $final_path ($complete_size bytes)"
+
+      rm -f \
+        "${part_path}.aria2" \
+        "$part_path" \
+        || true
+
+      return 0
+    fi
+
+    # If an older run left a partial file under the final name,
+    # convert it into the resumable .part path instead of throwing it away.
+    if [[ -f "$final_path" ]]; then
+
+      local final_size=0
+      local part_size=0
+
+      final_size="$(
+        stat -c%s "$final_path" 2>/dev/null \
+        || echo 0
+      )"
+
+      if [[ -f "$part_path" ]]; then
+        part_size="$(
+          stat -c%s "$part_path" 2>/dev/null \
+          || echo 0
+        )"
+      fi
+
+      if \
+        [[ ! -f "$part_path" ]] \
+        || [[ "$final_size" -gt "$part_size" ]]
+      then
+
+        log "Preserving existing partial Civitai file for resume: $final_path -> $part_path"
+
+        mv -f \
+          -- \
+          "$final_path" \
+          "$part_path"
+
+      else
+
+        log "Discarding smaller duplicate partial file: $final_path ($final_size bytes; resumable part=$part_size bytes)"
+
+        rm -f \
+          -- \
+          "$final_path"
+      fi
+    fi
+
+    log "Civitai download via aria2: connections=$CIVITAI_ARIA2_CONNECTIONS split=$CIVITAI_ARIA2_SPLIT min_split=$CIVITAI_ARIA2_MIN_SPLIT_SIZE"
+    log "Civitai resume file: $part_path"
+
+    set +e
+
+    if command -v aria2c >/dev/null 2>&1; then
+
+      aria2c \
+        --continue=true \
+        --auto-file-renaming=false \
+        --allow-overwrite=false \
+        --file-allocation=none \
+        --max-connection-per-server="$CIVITAI_ARIA2_CONNECTIONS" \
+        --split="$CIVITAI_ARIA2_SPLIT" \
+        --min-split-size="$CIVITAI_ARIA2_MIN_SPLIT_SIZE" \
+        --connect-timeout="$CIVITAI_CONNECT_TIMEOUT" \
+        --timeout="$CIVITAI_IO_TIMEOUT" \
+        --max-tries="$CIVITAI_MAX_TRIES" \
+        --retry-wait="$CIVITAI_RETRY_WAIT" \
+        --lowest-speed-limit="$CIVITAI_LOWEST_SPEED_LIMIT" \
+        --summary-interval=5 \
+        --console-log-level=warn \
+        --user-agent="Mozilla/5.0" \
+        -o "$part_name" \
+        -d "$dir" \
+        "$source_url"
+
+      rc=$?
+
+    else
+
+      log "WARNING: aria2c is unavailable; falling back to resumable curl."
+
+      curl \
+        -fL \
+        --connect-timeout "$CIVITAI_CONNECT_TIMEOUT" \
+        --retry "$CIVITAI_MAX_TRIES" \
+        --retry-delay "$CIVITAI_RETRY_WAIT" \
+        --retry-all-errors \
+        --speed-time 60 \
+        --speed-limit 65536 \
+        -A "Mozilla/5.0" \
+        -C - \
+        -o "$part_path" \
+        "$source_url"
+
+      rc=$?
+
+    fi
+
+    set -e
+
+    if [[ $rc -ne 0 ]]; then
+
+      log "Civitai download failed with rc=$rc"
+      log "Partial data was kept for resume: $part_path"
+
+      return "$rc"
+    fi
+
+    if ! provisioning_file_looks_complete \
+      "$part_path" \
+      "$expected_size"
+    then
+
+      local bad_size
+      bad_size="$(
+        stat -c%s "$part_path" 2>/dev/null \
+        || echo 0
+      )"
+
+      log "ERROR: Civitai download finished but validation failed: $part_path ($bad_size bytes)"
+
+      return 1
+    fi
+
+    mv -f \
+      -- \
+      "$part_path" \
+      "$final_path"
+
+    rm -f \
+      "${part_path}.aria2" \
+      || true
+
+    local downloaded_size
+    downloaded_size="$(
+      stat -c%s "$final_path" 2>/dev/null \
+      || echo 0
+    )"
+
+    log "Civitai download complete: $final_path"
+    log "Civitai final size: $downloaded_size bytes"
+
+    file "$final_path" \
+      || true
+
+    return 0
+  fi
+
+  # Metadata probe failed. aria2 can still follow the Civitai redirect and
+  # honor Content-Disposition. This mode is less deterministic for resume,
+  # but it is still multi-connection and preferable to a single curl stream.
+  log "WARNING: Civitai metadata probe failed; using aria2 Content-Disposition mode."
+
+  if ! command -v aria2c >/dev/null 2>&1; then
+    log "ERROR: aria2c is required when the Civitai filename probe fails."
+    return 1
+  fi
+
+  set +e
+
+  (
+    cd "$dir"
+
+    aria2c \
+      --continue=true \
+      --auto-file-renaming=false \
+      --allow-overwrite=false \
+      --file-allocation=none \
+      --content-disposition=true \
+      --max-connection-per-server="$CIVITAI_ARIA2_CONNECTIONS" \
+      --split="$CIVITAI_ARIA2_SPLIT" \
+      --min-split-size="$CIVITAI_ARIA2_MIN_SPLIT_SIZE" \
+      --connect-timeout="$CIVITAI_CONNECT_TIMEOUT" \
+      --timeout="$CIVITAI_IO_TIMEOUT" \
+      --max-tries="$CIVITAI_MAX_TRIES" \
+      --retry-wait="$CIVITAI_RETRY_WAIT" \
+      --lowest-speed-limit="$CIVITAI_LOWEST_SPEED_LIMIT" \
+      --summary-interval=5 \
+      --console-log-level=warn \
+      --user-agent="Mozilla/5.0" \
+      "$source_url"
+  )
+
+  rc=$?
+
+  set -e
+
+  return "$rc"
+}
+
+
 provisioning_download_to_dir() {
 
   local dir="$1"
@@ -1566,18 +2123,9 @@ provisioning_download_to_dir() {
 
     set +e
 
-    (
-      cd "$dir"
-
-      curl \
-        -fL \
-        --retry 5 \
-        --retry-delay 5 \
-        --retry-all-errors \
-        -H "User-Agent: Mozilla/5.0" \
-        -OJ \
-        "$final_url"
-    )
+    provisioning_civitai_aria2_download \
+      "$dir" \
+      "$final_url"
 
     local rc=$?
 
@@ -1585,7 +2133,7 @@ provisioning_download_to_dir() {
 
     if [[ $rc -ne 0 ]]; then
 
-      log "Civitai curl failed with rc=$rc"
+      log "Civitai aria2/resume download failed with rc=$rc"
 
       rm -f "$before_list"
 
@@ -1593,16 +2141,10 @@ provisioning_download_to_dir() {
 
     fi
 
-    if ! validate_downloaded_file_in_dir \
+    validate_downloaded_file_in_dir \
       "$dir" \
-      "$before_list"
-    then
-
-      rm -f "$before_list"
-
-      return 1
-
-    fi
+      "$before_list" \
+      || true
 
     rm -f "$before_list"
 
