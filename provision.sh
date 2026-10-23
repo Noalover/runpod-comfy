@@ -60,6 +60,7 @@ NODES=(
   "https://github.com/alisson-anjos/ComfyUI-BFSNodes"
   "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler"
   "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes"
+  "https://github.com/PBandDev/comfyui-ping"
 )
 
 CHECKPOINT_MODELS=(
