@@ -59,6 +59,7 @@ NODES=(
   "https://github.com/yolain/ComfyUI-Easy-Sam3"
   "https://github.com/alisson-anjos/ComfyUI-BFSNodes"
   "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler"
+  "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes"
 )
 
 CHECKPOINT_MODELS=(
@@ -95,7 +96,8 @@ VAE_MODELS=(
 )
 
 UPSCALE_MODELS=(
-  #"https://huggingface.co/Kim2091/2x-AnimeSharpV4/resolve/main/2x-AnimeSharpV4_RCAN.safetensors"
+  "https://huggingface.co/Kim2091/2x-AnimeSharpV4/resolve/main/2x-AnimeSharpV4_RCAN.safetensors"
+  "https://github.com/the-database/MangaJaNai/releases/download/3.0.0/IllustrationJaNai_V3detail.zip"
   #"https://huggingface.co/uwg/upscaler/resolve/main/ESRGAN/4x_NMKD-Siax_200k.pth"
 )
 
