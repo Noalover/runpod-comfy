@@ -1,4 +1,4 @@
-name: Build RunPod ComfyUI Wrapper
+name: Build and verify RunPod ComfyUI
 
 on:
   push:
@@ -6,9 +6,15 @@ on:
       - main
     paths:
       - Dockerfile
+      - bake.sh
+      - node-repos.txt
       - provision-hook.sh
+      - provision.sh
       - .github/workflows/build.yml
   workflow_dispatch:
+  schedule:
+    # Rebuild daily so the baked sources track upstream releases/commits.
+    - cron: '37 4 * * *'
 
 permissions:
   contents: read
@@ -17,6 +23,12 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    concurrency:
+      group: runpod-comfy-image
+      cancel-in-progress: false
+    env:
+      IMAGE: ghcr.io/noalover/runpod-comfy
+      CANDIDATE: ghcr.io/noalover/runpod-comfy:candidate-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Free disk space
@@ -49,9 +61,37 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push image
+      # SAFETY GATE: never push :latest during the build. An unsuccessful
+      # build or smoke test leaves the last known-good :latest untouched.
+      - name: Build candidate image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/noalover/runpod-comfy:latest
+          tags: ${{ env.CANDIDATE }}
+          build-args: |
+            BUILD_ID=${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify candidate image
+        run: |
+          docker pull "$CANDIDATE"
+          docker run --rm --entrypoint /bin/bash "$CANDIDATE" -lc '
+            set -euo pipefail
+            bash -n /provision-hook.sh /opt/runpod-comfy/bake.sh
+            test -f /opt/comfyui-baked/main.py
+            test -d /opt/comfyui-baked/custom_nodes/ComfyUI-KJNodes
+            test -f /opt/runpod-comfy/build-id
+            python3.12 -m pip check
+            while IFS= read -r repo || [[ -n "$repo" ]]; do
+              [[ -z "$repo" || "$repo" == \#* ]] && continue
+              node="${repo##*/}"
+              test -d "/opt/comfyui-baked/custom_nodes/$node"
+              test -f "/opt/runpod-comfy/baked-node-stamps/$node"
+            done < /opt/runpod-comfy/node-repos.txt
+          '
+
+      - name: Promote verified candidate to latest
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" \
+            "$CANDIDATE"
