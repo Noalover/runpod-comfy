@@ -81,7 +81,7 @@ jobs:
             test -f /opt/comfyui-baked/main.py
             test -d /opt/comfyui-baked/custom_nodes/ComfyUI-KJNodes
             test -f /opt/runpod-comfy/build-id
-            python3.12 -m pip check
+            python3.12 -c "import decord; from decord import VideoReader"
             while IFS= read -r repo || [[ -n "$repo" ]]; do
               [[ -z "$repo" || "$repo" == \#* ]] && continue
               node="${repo##*/}"
