@@ -103,6 +103,8 @@ done < "$REPOS_FILE"
 kj_after="$(git -C "$KJ_DIR" rev-parse HEAD 2>/dev/null || true)"
 [[ "$kj_before" == "$kj_after" ]] || die "KJNodes unexpectedly changed during baking"
 
-"$PYTHON_BIN" -m pip check || die "Dependency conflicts found"
+# Check dependencies while allowing one known decord wheel metadata bug. pip_check_output=""  if pip_check_output="$("$PYTHON_BIN" -m pip check 2>&1)"; then   log "Dependency check passed" else   printf '%s
+' "$pip_check_output"    remaining_errors="$(     printf '%s
+' "$pip_check_output" |       sed '/^decord 0\.6\.0 is not supported on this platform$/d'   )"    [[ -z "$remaining_errors" ]] || die "Dependency conflicts found"    # Verify that decord itself can actually be imported.   "$PYTHON_BIN" -c 'import decord; from decord import VideoReader' \     || die "decord import failed"    log "Known decord metadata issue ignored; import verified" fi
 rm -rf -- /tmp/comfy-core-source
 log "Bake succeeded: ComfyUI $stable_tag ($core_sha); KJNodes preserved"
