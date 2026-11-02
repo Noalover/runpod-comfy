@@ -629,27 +629,20 @@ pip_install_timed() {
     "$@"
 }
 
-patch_node_requirements() {
+prepare_node_requirements() {
 
-  local repo="$1"
-  local requirements="$2"
+  local requirements="$1"
+  local prepared
 
-  # Impact Pack's SAM2 dependency can spend forever building.
-  if grep -q 'facebookresearch/sam2' "$requirements" 2>/dev/null; then
+  # Create a disposable requirements file in the same directory so relative
+  # -r references still work. Never dirty the node's tracked Git files.
+  prepared="$(mktemp "$(dirname "$requirements")/.runpod-req.XXXXXXXX")" || return 1
 
-    log "Patching requirements: disabling facebookresearch/sam2 in $requirements"
+  # Keep the original Impact Pack SAM2 exclusion.
+  sed '/facebookresearch\/sam2/s/^/# /;s/^# # /# /' \
+    "$requirements" > "$prepared"
 
-    sed -i \
-      '/facebookresearch\/sam2/s/^/# /' \
-      "$requirements"
-
-  fi
-
-  # Avoid repeated '# #'.
-  sed -i \
-    's/^# # /# /' \
-    "$requirements" \
-    || true
+  printf '%s\n' "$prepared"
 }
 
 provisioning_tune_git() {
@@ -1034,21 +1027,37 @@ provisioning_get_apt_packages() {
     return 0
   fi
 
-  log "Installing apt packages: ${APT_PACKAGES[*]}"
+  # These tools are now baked into the Docker image. Avoid refreshing Ubuntu
+  # package indexes on every startup when everything is already installed.
+  local missing=()
+  local pkg
+  for pkg in "${APT_PACKAGES[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null \
+      | grep -qx 'install ok installed'; then
+      missing+=("$pkg")
+    fi
+  done
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    log "All apt packages already installed; skipping apt-get update"
+    return 0
+  fi
+
+  log "Installing missing apt packages: ${missing[*]}"
 
   if command -v sudo >/dev/null 2>&1; then
 
     sudo apt-get update
 
     sudo $APT_INSTALL \
-      "${APT_PACKAGES[@]}"
+      "${missing[@]}"
 
   else
 
     apt-get update
 
     $APT_INSTALL \
-      "${APT_PACKAGES[@]}"
+      "${missing[@]}"
 
   fi
 }
@@ -2747,21 +2756,41 @@ provisioning_get_nodes() {
 
     if [[ -f "$requirements" ]]; then
 
-      log "Installing requirements: $requirements"
+      # Compare installed-image and successful-runtime stamps. A new commit,
+      # changed requirements, or new image build invalidates the stamp.
+      local build_id node_sha req_hash stamp built_stamp runtime_stamp
+      build_id="$(cat /opt/runpod-comfy/build-id 2>/dev/null || echo legacy)"
+      node_sha="$(git -C "$path" rev-parse HEAD 2>/dev/null || echo unknown)"
+      req_hash="$(sha256sum "$requirements" | awk '{print $1}')"
+      stamp="${build_id}|${node_sha}|${req_hash}"
+      built_stamp="/opt/runpod-comfy/baked-node-stamps/$dir"
+      runtime_stamp="${COMFY_WORKSPACE}/.runpod-node-stamps/$dir"
 
-      patch_node_requirements \
-        "$repo" \
-        "$requirements"
+      if { [[ -f "$built_stamp" ]] && [[ "$(cat "$built_stamp")" == "$stamp" ]]; } \
+        || { [[ -f "$runtime_stamp" ]] && [[ "$(cat "$runtime_stamp")" == "$stamp" ]]; }; then
+        log "Requirements already baked/verified; skipping pip: $dir"
+        continue
+      fi
+
+      log "Installing changed/new requirements: $requirements"
+
+      local prepared_requirements
+      prepared_requirements="$(prepare_node_requirements "$requirements")" || {
+        log "Could not prepare requirements for $dir"
+        NODE_REQ_FAILS+=("$repo (requirements preparation failed)")
+        continue
+      }
 
       set +e
 
       pip_install_timed \
         "$PIP_REQ_TIMEOUT" \
-        -r "$requirements"
+        -r "$prepared_requirements"
 
       local rc=$?
 
       set -e
+      rm -f -- "$prepared_requirements"
 
       if [[ $rc -ne 0 ]]; then
 
@@ -2770,6 +2799,11 @@ provisioning_get_nodes() {
         NODE_REQ_FAILS+=(
           "$repo (requirements failed rc=$rc)"
         )
+
+      else
+
+        mkdir -p "$(dirname "$runtime_stamp")"
+        printf '%s\n' "$stamp" > "$runtime_stamp"
 
       fi
 
