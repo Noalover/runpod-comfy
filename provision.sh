@@ -110,13 +110,13 @@ SEEDVR2_MODELS=(
 )
 
 CONTROLNET_MODELS=(
-  "https://huggingface.co/toyxyz/Anima_ControlNet-LLLite/blob/main/anima_3dpose_6200.safetensors"
+  "https://huggingface.co/toyxyz/Anima_ControlNet-LLLite/resolve/main/anima_3dpose_6200.safetensors"
   "https://huggingface.co/kohya-ss/Anima-LLLite/resolve/main/anima-lllite-inpainting-v2.safetensors"
   "https://huggingface.co/kohya-ss/Anima-LLLite/resolve/main/anima-lllite-exp-change-2-000007.safetensors"
 )
 
 DIFFUSION_MODELS=(
-  #"https://civitai.com/api/download/models/3201770?fileId=3083049"
+  "https://civitai.com/api/download/models/3201770?fileId=3083049"
   #"https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors"
   #"https://civitai.com/api/download/models/3075206?fileId=2954323"
   #"https://civitai.com/api/download/models/3112659?fileId=2992771"
