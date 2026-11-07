@@ -110,7 +110,7 @@ SEEDVR2_MODELS=(
 )
 
 CONTROLNET_MODELS=(
-  #"https://huggingface.co/kohya-ss/Anima-LLLite/resolve/main/anima-lllite-any-test-like-v2.safetensors"
+  "https://huggingface.co/toyxyz/Anima_ControlNet-LLLite/blob/main/anima_3dpose_6200.safetensors"
   "https://huggingface.co/kohya-ss/Anima-LLLite/resolve/main/anima-lllite-inpainting-v2.safetensors"
   "https://huggingface.co/kohya-ss/Anima-LLLite/resolve/main/anima-lllite-exp-change-2-000007.safetensors"
 )
