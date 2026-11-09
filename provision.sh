@@ -95,6 +95,7 @@ VAE_MODELS=(
   "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors"
   "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors"
   "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/vae/flux2-vae.safetensors"
+  "https://huggingface.co/dully3865/Minimax_H3_seamless_anime_VAE/resolve/main/minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors"
 )
 
 UPSCALE_MODELS=(
